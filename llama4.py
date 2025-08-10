@@ -528,35 +528,18 @@ class VisionBackbone(nn.Module):
 # Vision Adapter + Projector
 # ==========================
 class VisionAdapter(nn.Module):
-    """
-    GGML:
-      v.vision_adapter.mlp.fc1.weight: [5632, 4096]
-      v.vision_adapter.mlp.fc2.weight: [4096, 4096]
-      mm.linear_1.weight: [4096, 5120] -> Linear(4096 -> 5120)
-
-    We pool the class token, map to 4096 via 2-layer MLP, then project to 5120 for fusion.
-    """
-    def __init__(self, cfg: Llama4Config):
+    def __init__(self, cfg):
         super().__init__()
-        self.fc1 = nn.Linear(cfg.v_ffn_hidden, cfg.adapter_hidden, bias=False)
-        self.fc2 = nn.Linear(cfg.adapter_hidden, cfg.adapter_hidden, bias=False)
-        self.proj = nn.Linear(cfg.adapter_hidden, cfg.proj_out_text_dim, bias=False)
-
-    def forward(self, vis_seq: torch.Tensor):
-        # vis_seq: [B, 1+N, 1408]; take CLS (index 0), first upsample to 5632 hidden via a learned linear?
-        # In your tensors, the adapter expects 5632 input; we build a small mapper from 1408->5632 implicitly:
-        # Use a linear to 5632 before fc1 if needed. For now, pool features to [B,1408] and project to 5632 via a weight in fc1.
-        # To match shapes strictly, we first expand to 5632 using a learned matrix inside fc1 (weight is [5632, 4096] in GGML);
-        # We'll approximate by projecting 1408 -> 4096 before fc1:
-        # (Keep as a simple two-layer MLP in 4096 space.)
-        b, t, c = vis_seq.shape
-        cls = vis_seq[:, 0]                        # [B,1408]
-        # Simple linear lift to 4096, then adapter MLP:
-        lift = F.linear(cls, torch.empty(4096, c, device=cls.device))  # temp param placeholder during actual loading
-        y = self.fc2(F.gelu(self.fc1(F.gelu(lift))))  # [B,4096]
-        y = self.proj(y)                              # [B,5120]
-        return y
-
+        self.input_proj = nn.Linear(cfg.v_d_model, 4096, bias=False)   # 1408→4096  (new; not in dump, must be trained/finetuned)
+        self.fc1  = nn.Linear(4096, 5632, bias=False)                  # load from v.vision_adapter.mlp.fc1.weight
+        self.fc2  = nn.Linear(5632, 4096, bias=False)                  # load from v.vision_adapter.mlp.fc2.weight
+        self.proj = nn.Linear(4096, cfg.proj_out_text_dim, bias=False) # load from mm.linear_1.weight
+    def forward(self, vis_seq):
+        cls = vis_seq[:, 0]           # [B,1408]
+        y = self.input_proj(cls)      # [B,4096]
+        y = F.gelu(self.fc1(y))       # [B,5632]
+        y = self.fc2(y)               # [B,4096]
+        return self.proj(y)           # [B,5120]
 
 # ==========================
 # Full Multimodal Model
